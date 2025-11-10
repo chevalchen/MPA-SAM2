@@ -31,7 +31,7 @@ class SAM2Transforms(nn.Module):
         # self.resize = Resize(
         #     resolution, interpolation=T.InterpolationMode.BILINEAR, max_size=resolution, antialias=True
         # )
-        self.resize = Resize([512,512])
+        self.resize = Resize(resolution)
         self.normalize = Normalize(mean=self.mean, std=self.std)  
         # end  
         self.transforms = torch.jit.script(
