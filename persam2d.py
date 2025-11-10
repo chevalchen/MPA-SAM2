@@ -55,23 +55,33 @@ def train_persam2_f(
     predictor = auto_predictor.predictor
     model = predictor.model
 
+    # 2. Prepare Ground Truth Mask for training
     gt_mask = torch.tensor(ref_mask).float().unsqueeze(0).to(device)
+    # Ensure GT is 0/1
     gt_mask = (gt_mask > 0).float()
 
+    # [cite_start]3. Setup learnable prompt [cite: 11]
     initial_prompt = auto_predictor.visual_prompt.clone().detach()
     finetuned_prompt = nn.Parameter(initial_prompt, requires_grad=True)
     
+    # [cite_start]4. Optimizer for ONLY the prompt [cite: 12]
     optimizer = torch.optim.AdamW([finetuned_prompt], lr=lr, eps=1e-4)
-
+    
+    # [cite_start]5. Pre-calculate frozen features to keep loop efficient [cite: 14, 20]
+    # We need raw features for the manual forward pass
     with torch.no_grad():
+        # Ensure the predictor is set to the reference image (set_reference does this)
         ref_feat_raw = predictor._features["image_embed"]
         high_res_feats = predictor._features["high_res_feats"]
         
+        # We need a spatial prompt to guide the decoder even during fine-tuning.
+        # We use the auto-detected point on the reference image itself.
         h, w = ref_image.shape[:2]
         point_coords, point_labels = auto_predictor._calculate_similarity_and_get_point(
             predictor._features, initial_prompt, (h, w)
         )
         
+        # Pre-encode the spatial prompt
         sparse_embeddings, dense_embeddings = model.sam_prompt_encoder(
             points=(point_coords, point_labels), boxes=None, masks=None
         )
@@ -82,8 +92,11 @@ def train_persam2_f(
     for i in tqdm(range(iterations)):
         optimizer.zero_grad()
 
+        # [cite_start]Custom minimal forward pass allowing gradient flow [cite: 13]
+        # [cite_start]1. Combine embeddings [cite: 14]
         current_embedding = ref_feat_raw + finetuned_prompt
 
+        # [cite_start]2. Pass to decoder (bypassing @torch.no_grad of standard predict) [cite: 15]
         low_res_masks, _, _, _ = model.sam_mask_decoder(
             image_embeddings=current_embedding,
             image_pe=model.sam_prompt_encoder.get_dense_pe(),
@@ -103,8 +116,18 @@ def train_persam2_f(
             align_corners=False
         )
         
+        # Select the best mask if multimask output (simplified: often index 0 or 1 is best in PerSAM)
+        # For stability in training, we often take the one with highest initial score or just all.
+        # Here we simplify by taking the best matching mask to GT for loss to avoid mode collapse issues.
+        # A simple robust way is to use the mask that is most confident or just average loss over plausible masks.
+        # Let's use the first mask for simplicity in this minimal implementation, or best IoU.
+        # Standard SAM usually puts best single-object mask at index 0 when multimask=False, 
+        # but with multimask=True it returns 3. Let's use the one that matches GT best to optimize.
+        
+        # (Optional refined selection could go here, using simple index 0 for this example)
         main_mask_logits = masks[:, 0, :, :] 
 
+        # [cite_start]4. Calculate Loss [cite: 16]
         dice_loss = calculate_dice_loss(main_mask_logits, gt_mask)
         focal_loss = calculate_sigmoid_focal_loss(main_mask_logits, gt_mask)
         loss = dice_loss + focal_loss
@@ -128,6 +151,10 @@ def inference_persam2_f(
     mask_output_path: str = None
 
 ):
+    """
+    [cite_start]Run inference on a test image using the fine-tuned prompt[cite: 18].
+    """
+    # [cite_start]Override internal visual_prompt with our fine-tuned one [cite: 18]
     original_prompt = auto_predictor.visual_prompt
     auto_predictor.visual_prompt = finetuned_prompt
 
@@ -143,14 +170,8 @@ def inference_persam2_f(
 
     if vis_output_path:
         plt.figure(figsize=(10, 10))
-        # plt.imshow(test_image)
-        # show_mask(final_mask, plt.gca())
-        overlay_img = test_image.copy()
-        alpha = 0.5  # 半透明程度
-        overlay_img[final_mask > 0] = (
-            alpha * np.array([0, 255, 0]) + (1 - alpha) * overlay_img[final_mask > 0]
-        )
-        plt.imshow(overlay_img)
+        plt.imshow(test_image)
+        show_mask(final_mask, plt.gca())
         # add click icon
         auto_point_coords, _ = auto_predictor._calculate_similarity_and_get_point(
             auto_predictor.predictor._features,
@@ -160,16 +181,17 @@ def inference_persam2_f(
         x, y = int(auto_point_coords[0, 0, 0].item()), int(auto_point_coords[0, 0, 1].item())
 
         icon_path = "icon/click.png"
-
         if os.path.exists(icon_path):
             icon = cv2.imread(icon_path, cv2.IMREAD_UNCHANGED)
             if icon is not None:
                 ih, iw = icon.shape[:2]
+                # compute top-left corner
                 y1, y2 = max(0, y - ih // 2), min(test_image.shape[0], y + ih // 2)
                 x1, x2 = max(0, x - iw // 2), min(test_image.shape[1], x + iw // 2)
                 icon_resized = icon[: y2 - y1, : x2 - x1]
-                # overlay = test_image.copy()
-                overlay = overlay_img.copy()
+
+                # overlay icon (handle alpha)
+                overlay = test_image.copy()
                 if icon_resized.shape[2] == 4:
                     alpha = icon_resized[:, :, 3] / 255.0
                     for c in range(3):
