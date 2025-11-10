@@ -143,13 +143,14 @@ class SAM2ImagePredictor:
             for feat_level in self._features["high_res_feats"]
         ]
 
-        # MODIFICATION START
+        # ---modified by csq: add spatial_prompt part
         # get current embeding
         current_image_embed = self._features["image_embed"][img_idx].unsqueeze(0)
         # add visual prompt to embeding
-        if visual_prompt is not None:
-            current_image_embed = current_image_embed + visual_prompt
-        # MODIFICATION END
+        if visual_prompt is not None and hasattr(self,"spatial_prompt"):
+            alpha, beta = 1.0,0.5
+            current_image_embed = current_image_embed + alpha*visual_prompt + beta*spatial_prompt
+        # ---END
 
         low_res_masks, iou_predictions, _, _ = self.model.sam_mask_decoder(
             # using modified embeding

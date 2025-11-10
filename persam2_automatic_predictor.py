@@ -22,6 +22,8 @@ class PerSAM2AutomaticPredictor:
         self.model = build_sam2(model_config_path, sam2_model_path)
         self.predictor = SAM2ImagePredictor(self.model)
         self.visual_prompt: Optional[torch.Tensor] = None
+        # modified by csq: init spatial_prompt part
+        self.spatial_prompt: Optional[torch.Tensor] = None
         self.device = self.model.device
         self.model.eval()
         print(f"Model loaded to {self.device}")
@@ -38,6 +40,9 @@ class PerSAM2AutomaticPredictor:
             ref_mask_tensor = ref_mask_tensor.unsqueeze(0)
         processed_ref_mask = self.predictor._transforms.transform_masks(ref_mask_tensor)
         self.visual_prompt = self._extract_visual_prompt(ref_features, processed_ref_mask)
+        # ---modified by csq: add spatial_prompt part
+        self.spatial_prompt = self._extract_spatial_prompt(processed_ref_mask)
+        # ---end
         print("Reference set. Visual prompt calculated.")
 
     @torch.no_grad()
@@ -58,7 +63,7 @@ class PerSAM2AutomaticPredictor:
             multimask_output=True,
         )
         return masks, iou, logits
-
+    # ---modified by csq 1110
     def _extract_visual_prompt(
         self,
         ref_features: Dict[str, torch.Tensor],
@@ -72,6 +77,30 @@ class PerSAM2AutomaticPredictor:
         mask = (mask > 0.5).float()
         prompt = torch.sum(features * mask, dim=[2, 3]) / (mask.sum(dim=[2, 3]) + 1e-6)
         return prompt.reshape(B, C, 1, 1)
+    # modified by csq: add spatial_prompt function
+    def _extract_spatial_prompt(self, mask: torch.Tensor) -> torch.Tensor:
+        # mask shape: [B, H, W] 或 [B, 1, H, W]
+        if mask.ndim == 3:  # [B, H, W] -> [B,1,H,W]
+            mask = mask.unsqueeze(1)
+        elif mask.ndim != 4:
+            raise ValueError(f"Unexpected mask shape {mask.shape}, expected 3 or 4 dims")
+
+        ref_features = self.predictor._features
+        features = ref_features["image_embed"]  # [B, C, H_feat, W_feat]
+        B, C, H_feat, W_feat = features.shape
+
+        # 下采样 mask 到特征图大小
+        mask_lowres = F.interpolate(mask.float(), size=(H_feat, W_feat), mode="bilinear", align_corners=False)
+
+        # 可选二值化或归一化
+        mask_lowres = mask_lowres / (mask_lowres.max(dim=2, keepdim=True)[0].max(dim=3, keepdim=True)[0] + 1e-6)
+
+        # 加权平均 pooling
+        spatial_prompt = torch.sum(features * mask_lowres, dim=[2, 3]) / (mask_lowres.sum(dim=[2, 3]) + 1e-6)
+        spatial_prompt = spatial_prompt.reshape(B, C, 1, 1)
+
+        return spatial_prompt
+
 
     def _calculate_similarity_and_get_point(
         self,
@@ -89,10 +118,20 @@ class PerSAM2AutomaticPredictor:
         y_feat, x_feat = _unravel_index(max_idx, (H_feat, W_feat))
         y_feat = y_feat.float()
         x_feat = x_feat.float()
-        scale_h = orig_h / H_feat
-        scale_w = orig_w / W_feat
-        y_orig = (y_feat + 0.5) * scale_h
-        x_orig = (x_feat + 0.5) * scale_w
+        # scale_h = orig_h / H_feat
+        # scale_w = orig_w / W_feat
+        # y_orig = (y_feat + 0.5) * scale_h
+        # x_orig = (x_feat + 0.5) * scale_w
+        # --- modified by csq 1110
+        # get model input resolution (after SAM2Transforms)
+        model_res = self.predictor._transforms.resolution
+        scale_h = model_res / orig_h
+        scale_w = model_res / orig_w
+        y_model = (y_feat + 0.5) * (model_res / H_feat)
+        x_model = (x_feat + 0.5) * (model_res / W_feat)
+        y_orig = y_model / scale_h
+        x_orig = x_model / scale_w
+        # --- end modified ---
         coords = torch.stack([x_orig, y_orig], dim=1)
         auto_point_coords = coords.unsqueeze(1)
         auto_point_labels = torch.ones(B, 1, device=self.device, dtype=torch.int)
