@@ -180,7 +180,7 @@ class SAM2ImagePredictor:
         mask_input_batch: List[np.ndarray] = None,
         multimask_output: bool = True,
         return_logits: bool = False,
-        normalize_coords=True,
+        normalize_coords=True
     ) -> Tuple[List[np.ndarray], List[np.ndarray], List[np.ndarray]]:
         """This function is very similar to predict(...), however it is used for batched mode, when the model is expected to generate predictions on multiple images.
         It returns a tuple of lists of masks, ious, and low_res_masks_logits.
@@ -243,6 +243,8 @@ class SAM2ImagePredictor:
         multimask_output: bool = True,
         return_logits: bool = False,
         normalize_coords=True,
+        attn_sim=None,   # new
+        target_embedding=None  # new
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
         Predict masks for the given input prompts, using the currently set image.
@@ -295,6 +297,8 @@ class SAM2ImagePredictor:
             mask_input,
             multimask_output,
             return_logits=return_logits,
+            attn_sim=attn_sim,  # new
+            target_embedding=target_embedding,  # new
         )
 
         masks_np = masks.squeeze(0).float().detach().cpu().numpy()
@@ -343,6 +347,8 @@ class SAM2ImagePredictor:
         multimask_output: bool = True,
         return_logits: bool = False,
         img_idx: int = -1,
+        attn_sim=None,  # new
+        target_embedding=None,  # new
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Predict masks for the given input prompts, using the currently set image.
@@ -425,6 +431,8 @@ class SAM2ImagePredictor:
             multimask_output=multimask_output,
             repeat_image=batched_mode,
             high_res_features=high_res_features,
+            # attn_sim=attn_sim,
+            # target_embedding=target_embedding
         )
 
         # Upscale the masks to the original image resolution

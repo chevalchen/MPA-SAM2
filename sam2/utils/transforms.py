@@ -10,6 +10,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torchvision.transforms import Normalize, Resize, ToTensor, Pad
+from torchvision.transforms import InterpolationMode
 
 
 class SAM2Transforms(nn.Module):
@@ -80,23 +81,44 @@ class SAM2Transforms(nn.Module):
         boxes = self.transform_coords(boxes.reshape(-1, 2, 2), normalize, orig_hw)
         return boxes
 
+    # # modified by csq 1107
+    # def transform_masks(self, masks: torch.Tensor) -> torch.Tensor:
+    #     """
+    #     Transforms masks to the model input size.
+    #     """
+    #     # Resize the mask to the input size using the same resize as images
+
+    #     masks = self.resize(masks)
+    #     # Pad the mask to the model input size (using the pad determined in apply_image, 
+    #     # or re-calculating if apply_image wasn't called recently, safest to re-calculate)
+    #     h, w = masks.shape[-2:]
+    #     pad_h = self.resolution - h
+    #     pad_w = self.resolution - w
+    #     # Create a temporary pad just for this call to be safe against state changes
+    #     pad = Pad(padding=(0, 0, pad_w, pad_h), padding_mode="constant", fill=0)
+        
+    #     masks = pad(masks)
+    #     return masks
+    # # end
     # modified by csq 1107
     def transform_masks(self, masks: torch.Tensor) -> torch.Tensor:
         """
         Transforms masks to the model input size.
-        """
-        # Resize the mask to the input size using the same resize as images
-
-        masks = self.resize(masks)
-        # Pad the mask to the model input size (using the pad determined in apply_image, 
-        # or re-calculating if apply_image wasn't called recently, safest to re-calculate)
-        h, w = masks.shape[-2:]
-        pad_h = self.resolution - h
-        pad_w = self.resolution - w
-        # Create a temporary pad just for this call to be safe against state changes
-        pad = Pad(padding=(0, 0, pad_w, pad_h), padding_mode="constant", fill=0)
         
-        masks = pad(masks)
+        [FIXED P1] This transform MUST match the spatial transform applied to the image.
+        The image transform (self.transforms) uses Resize((self.resolution, self.resolution)),
+        which stretches/squashes the image to a square.
+        Therefore, we must apply the exact same stretch/squash resize to the mask
+        and remove the old padding logic.
+        """
+        mask_resize_transform = Resize(
+            (self.resolution, self.resolution),
+            interpolation=InterpolationMode.NEAREST, # Use NEAREST for masks
+            antialias=False # No antialias for masks
+        )
+        
+        masks = mask_resize_transform(masks)
+        
         return masks
     # end
     def postprocess_masks(self, masks: torch.Tensor, orig_hw) -> torch.Tensor:
