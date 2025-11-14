@@ -62,19 +62,12 @@ class TwoWayTransformer(nn.Module):
         )
         self.norm_final_attn = nn.LayerNorm(embedding_dim)
 
-    # def forward(
-    #     self,
-    #     image_embedding: Tensor,
-    #     image_pe: Tensor,
-    #     point_embedding: Tensor,
-    # ) -> Tuple[Tensor, Tensor]:
-    def forward(self,
-            image_embedding,
-            image_pe,
-            point_embedding,
-            attn_sim=None,
-            target_embedding=None):
-
+    def forward(
+        self,
+        image_embedding: Tensor,
+        image_pe: Tensor,
+        point_embedding: Tensor,
+    ) -> Tuple[Tensor, Tensor]:
         """
         Args:
           image_embedding (torch.Tensor): image to attend to. Should be shape
@@ -98,32 +91,18 @@ class TwoWayTransformer(nn.Module):
         keys = image_embedding
 
         # Apply transformer blocks and final layernorm
-        # for layer in self.layers:
-        #     queries, keys = layer(
-        #         queries=queries,
-        #         keys=keys,
-        #         query_pe=point_embedding,
-        #         key_pe=image_pe,
-        #     )
         for layer in self.layers:
-            if target_embedding is not None:
-                queries = queries + target_embedding   
             queries, keys = layer(
                 queries=queries,
                 keys=keys,
                 query_pe=point_embedding,
                 key_pe=image_pe,
-                attn_sim=attn_sim,
             )
 
         # Apply the final attention layer from the points to the image
         q = queries + point_embedding
-        # ---Add
-        if target_embedding is not None:
-          q = q + target_embedding    
-        # ---End
         k = keys + image_pe
-        attn_out = self.final_attn_token_to_image(q=q, k=k, v=keys, attn_sim=attn_sim)
+        attn_out = self.final_attn_token_to_image(q=q, k=k, v=keys)
         queries = queries + attn_out
         queries = self.norm_final_attn(queries)
 
@@ -174,10 +153,9 @@ class TwoWayAttentionBlock(nn.Module):
 
         self.skip_first_layer_pe = skip_first_layer_pe
 
-    # def forward(
-    #     self, queries: Tensor, keys: Tensor, query_pe: Tensor, key_pe: Tensor
-    # ) -> Tuple[Tensor, Tensor]:
-    def forward(self, queries, keys, query_pe, key_pe, attn_sim=None):
+    def forward(
+        self, queries: Tensor, keys: Tensor, query_pe: Tensor, key_pe: Tensor
+    ) -> Tuple[Tensor, Tensor]:
         # Self attention block
         if self.skip_first_layer_pe:
             queries = self.self_attn(q=queries, k=queries, v=queries)
@@ -190,8 +168,7 @@ class TwoWayAttentionBlock(nn.Module):
         # Cross attention block, tokens attending to image embedding
         q = queries + query_pe
         k = keys + key_pe
-        # attn_out = self.cross_attn_token_to_image(q=q, k=k, v=keys)
-        attn_out = self.cross_attn_token_to_image(q=q, k=k, v=keys, attn_sim=attn_sim)
+        attn_out = self.cross_attn_token_to_image(q=q, k=k, v=keys)
         queries = queries + attn_out
         queries = self.norm2(queries)
 
@@ -250,7 +227,7 @@ class Attention(nn.Module):
         x = x.transpose(1, 2)
         return x.reshape(b, n_tokens, n_heads * c_per_head)  # B x N_tokens x C
 
-    def forward(self, q: Tensor, k: Tensor, v: Tensor, attn_sim: Tensor = None) -> Tensor:
+    def forward(self, q: Tensor, k: Tensor, v: Tensor) -> Tensor:
         # Input projections
         q = self.q_proj(q)
         k = self.k_proj(k)
@@ -263,16 +240,7 @@ class Attention(nn.Module):
 
         dropout_p = self.dropout_p if self.training else 0.0
         # Attention
-        # out = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
-        attn = torch.matmul(q, k.transpose(-1, -2))  # B, heads, Nq, Nk
-        attn = attn / math.sqrt(q.size(-1))
-
-        if attn_sim is not None:
-            attn = attn + attn_sim
-
-        attn = torch.softmax(attn, dim=-1)
-
-        out = torch.matmul(attn, v)  # B, heads, Nq, C
+        out = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
 
         out = self._recombine_heads(out)
         out = self.out_proj(out)

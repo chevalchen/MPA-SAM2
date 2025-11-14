@@ -1,250 +1,428 @@
 import os
+import glob
+import argparse
+from typing import Dict, Optional, Tuple
+
 import cv2
 import numpy as np
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
+from sklearn.cluster import KMeans
 from tqdm import tqdm
 import matplotlib.pyplot as plt
-import argparse
-import glob
 
-# Assumes these are in the same directory or python path
-from persam2_automatic_predictor import PerSAM2AutomaticPredictor
-from sam2.persam2_image_predictor import SAM2ImagePredictor
+from sam2.build_sam import build_sam2
+from sam2.sam2_image_predictor import SAM2ImagePredictor
 
-# --- Loss Functions (Adapted from persam_f.py) ---
-def calculate_dice_loss(inputs, targets, num_masks=1):
-    # Compute the DICE loss, similar to generalized IOU for masks.
-    inputs = inputs.sigmoid()
-    inputs = inputs.flatten(1)
-    targets = targets.flatten(1)
-    numerator = 2 * (inputs * targets).sum(-1)
-    denominator = inputs.sum(-1) + targets.sum(-1)
-    loss = 1 - (numerator + 1) / (denominator + 1)
-    return loss.sum() / num_masks
 
-def calculate_sigmoid_focal_loss(inputs, targets, num_masks=1, alpha: float = 0.25, gamma: float = 2):
-    # Loss used in RetinaNet for dense detection
-    prob = inputs.sigmoid()
-    inputs = inputs.flatten(1)
-    targets = targets.flatten(1)
-    ce_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction="none")
-    p_t = prob.flatten(1) * targets + (1 - prob.flatten(1)) * (1 - targets)
-    loss = ce_loss * ((1 - p_t) ** gamma)
+class AutomaticPointor:
+    def __init__(self, sam2_checkpoint: str, sam2_cfg: str, device: Optional[str] = None):
+        self.model = build_sam2(sam2_cfg, sam2_checkpoint)
+        self.predictor = SAM2ImagePredictor(self.model)
+        self.device = device or self.model.device
+        self.model.eval()
+        self.visual_prompt: Optional[torch.Tensor] = None
+        self.ref_feats_for_clustering: Optional[torch.Tensor] = None
+        self.ref_mask_for_clustering: Optional[torch.Tensor] = None
+        self.num_prompt_clusters = 1
+        self.cluster_agg_method = "mean"
+        self.last_points: Optional[torch.Tensor] = None
+        self.last_labels: Optional[torch.Tensor] = None
+        # ---Add target embedding
+        self.target_embedding : Optional[torch.Tensor] = None,
+        self.target_feat : Optional[torch.Tensor] = None
 
-    if alpha >= 0:
-        alpha_t = alpha * targets + (1 - alpha) * (1 - targets)
-        loss = alpha_t * loss
+    def set_reference(self, ref_image: np.ndarray, ref_mask: np.ndarray) -> None:
+        self.predictor.set_image(ref_image)
+        ref_features = self.predictor._features
+        mask = torch.as_tensor(ref_mask, dtype=torch.float, device=self.device)
+        if mask.ndim == 2:
+            mask = mask.unsqueeze(0)
+        if mask.ndim == 3:
+            mask = mask.unsqueeze(1)
+        processed_mask = self.predictor._transforms.transform_masks(mask)
 
-    return loss.mean(1).sum() / num_masks
-
-# --- Phase 2: One-Shot Fine-Tuning ---
-def train_persam2_f(
-    auto_predictor: PerSAM2AutomaticPredictor,
-    ref_image: np.ndarray,
-    ref_mask: np.ndarray,
-    iterations: int = 1000,
-    lr: float = 1e-3
-):
-    # Fine-tunes only the visual prompt on the reference image
-    print("======> Phase 1: Initializing Reference...")
-    auto_predictor.set_reference(ref_image, ref_mask)
-    
-    device = auto_predictor.device
-    predictor = auto_predictor.predictor
-    model = predictor.model
-
-    # 2. Prepare Ground Truth Mask for training
-    gt_mask = torch.tensor(ref_mask).float().unsqueeze(0).to(device)
-    # Ensure GT is 0/1
-    gt_mask = (gt_mask > 0).float()
-
-    # [cite_start]3. Setup learnable prompt [cite: 11]
-    initial_prompt = auto_predictor.visual_prompt.clone().detach()
-    finetuned_prompt = nn.Parameter(initial_prompt, requires_grad=True)
-    
-    # [cite_start]4. Optimizer for ONLY the prompt [cite: 12]
-    optimizer = torch.optim.AdamW([finetuned_prompt], lr=lr, eps=1e-4)
-    
-    # [cite_start]5. Pre-calculate frozen features to keep loop efficient [cite: 14, 20]
-    # We need raw features for the manual forward pass
-    with torch.no_grad():
-        # Ensure the predictor is set to the reference image (set_reference does this)
-        ref_feat_raw = predictor._features["image_embed"]
-        high_res_feats = predictor._features["high_res_feats"]
+        feats = ref_features["image_embed"]
+        if feats.dim() == 3:
+            feats = feats.unsqueeze(0)
+        Bf, C, Hf, Wf = feats.shape
+        self.ref_feats_for_clustering = feats.permute(0, 2, 3, 1).detach()
+        mask_feat = F.interpolate(processed_mask.float(), size=(Hf, Wf), mode="bilinear", align_corners=False)
+        self.ref_mask_for_clustering = (mask_feat > 0.5).squeeze(1).bool().detach()
+        #
+        # ---Add
+        # --- This block is now the *only* place the mean feature is calculated ---
+        b, hf, wf, c = self.ref_feats_for_clustering.shape
+        target_embeddings = []
+        for i in range(b):
+            feat_b = self.ref_feats_for_clustering[i]  # [Hf, Wf, C]
+            mask_b = self.ref_mask_for_clustering[i]  # [Hf, Wf]
+            
+            target_feat_pixels = feat_b[mask_b] # [N, C]
+            if target_feat_pixels.shape[0] == 0:
+                target_embedding_b = feat_b.mean([0, 1]).unsqueeze(0) # [1, C]
+            else:
+                target_embedding_b = target_feat_pixels.mean(0).unsqueeze(0) # [1, C]
+            
+            target_embeddings.append(target_embedding_b)
         
-        # We need a spatial prompt to guide the decoder even during fine-tuning.
-        # We use the auto-detected point on the reference image itself.
-        h, w = ref_image.shape[:2]
-        point_coords, point_labels = auto_predictor._calculate_similarity_and_get_point(
-            predictor._features, initial_prompt, (h, w)
+        # This is the unnormalized embedding for target-semantic prompting
+        self.target_embedding = torch.cat(target_embeddings, dim=0).unsqueeze(1) # [B, 1, C]
+
+
+        # --- This part is calculated by the original persam2s function ---
+        self.visual_prompt = self.extract_visual_prompt(ref_features, processed_mask)
+        # --- This line is new: Derive target_feat from visual_prompt ---
+        # self.visual_prompt is [B, C, 1, 1]
+        # We need self.target_feat to be [B, 1, C]
+        b, c, _, _ = self.visual_prompt.shape
+        self.target_feat = self.visual_prompt.view(b, c, -1).permute(0, 2, 1)
+        # ---END
+
+    def predict(self, test_image: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        if self.visual_prompt is None:
+            raise ValueError("Reference not set. Call set_reference() first.")
+        self.predictor.set_image(test_image)
+        cached_features = self.predictor._features
+        orig_hw = self.predictor._orig_hw[0]
+        # <<< START OF ADDED CODE >>>
+        # Calculate attn_sim from persam.py logic
+        test_feat_embed = cached_features["image_embed"] # [B, C, Hf, Wf]
+        b, c, hf, wf = test_feat_embed.shape
+
+        # Normalize test features
+        norm_test_feat = F.normalize(test_feat_embed, p=2, dim=1)
+        norm_test_feat_flat = norm_test_feat.view(b, c, hf * wf) # [B, C, Hf*Wf]
+
+        # self.target_feat is [B, 1, C]
+        # Perform batched matrix multiplication for cosine similarity
+        sim = torch.bmm(self.target_feat, norm_test_feat_flat) # [B, 1, Hf*Wf]
+        sim = sim.view(b, 1, hf, wf) # [B, 1, Hf, Wf]
+
+        # Upsample sim map to original image size (like postprocess_masks)
+        sim_orig = F.interpolate(sim, size=orig_hw, mode="bilinear", align_corners=False)
+        sim_orig = sim_orig.squeeze(1) # [B, orig_h, orig_w]
+
+        # Normalize and downsample to 64x64 for attn_sim
+        attn_sim_list = []
+        for i in range(b):
+            sim_b = sim_orig[i] # [orig_h, orig_w]
+            sim_std = torch.std(sim_b)
+            if sim_std == 0: # Avoid division by zero
+                sim_std = 1.0
+            sim_b = (sim_b - sim_b.mean()) / sim_std
+            sim_b_64 = F.interpolate(sim_b.unsqueeze(0).unsqueeze(0), size=(64, 64), mode="bilinear")
+            # [1, 1, 4096]
+            attn_sim_b = sim_b_64.sigmoid_().unsqueeze(0).flatten(3) 
+            attn_sim_list.append(attn_sim_b)
+        
+        # Final attn_sim
+        attn_sim = torch.cat(attn_sim_list, dim=0) # [B, 1, 4096]
+        # <<< END OF ADDED CODE >>>
+
+        auto_point_coords, auto_point_labels = self.cal_point(
+            cached_features, self.visual_prompt, orig_hw
         )
-        
-        # Pre-encode the spatial prompt
-        sparse_embeddings, dense_embeddings = model.sam_prompt_encoder(
-            points=(point_coords, point_labels), boxes=None, masks=None
+        # for vis
+        self.last_points = auto_point_coords
+        self.last_labels = auto_point_labels
+
+        masks, scores, logits = self.predictor.predict(
+            point_coords=auto_point_coords.cpu().numpy(),
+            point_labels=auto_point_labels.cpu().numpy(),
+            multimask_output=True,
+            attn_sim=attn_sim,
+            target_embedding=self.target_embedding
         )
 
-    print(f"======> Phase 2: Start One-Shot Fine-Tuning for {iterations} iterations...")
-    model.sam_mask_decoder.train(False) # Keep decoder in eval mode
-    
-    for i in tqdm(range(iterations)):
-        optimizer.zero_grad()
+        best_idx = int(np.argmax(scores))
+        best_logits = torch.as_tensor(logits[best_idx][None, ...], device=self.device)
 
-        # [cite_start]Custom minimal forward pass allowing gradient flow [cite: 13]
-        # [cite_start]1. Combine embeddings [cite: 14]
-        current_embedding = ref_feat_raw + finetuned_prompt
-
-        # [cite_start]2. Pass to decoder (bypassing @torch.no_grad of standard predict) [cite: 15]
-        low_res_masks, _, _, _ = model.sam_mask_decoder(
-            image_embeddings=current_embedding,
-            image_pe=model.sam_prompt_encoder.get_dense_pe(),
-            sparse_prompt_embeddings=sparse_embeddings,
-            dense_prompt_embeddings=dense_embeddings,
-            multimask_output=True, # Use multimask to allow network to find best fit
-            repeat_image=False,
-            high_res_features=high_res_feats,
+        masks_ref1, scores_ref1, logits_ref1 = self.predictor.predict(
+            point_coords=auto_point_coords.cpu().numpy(),
+            point_labels=auto_point_labels.cpu().numpy(),
+            mask_input=best_logits.cpu().numpy(),
+            multimask_output=True,
         )
-        
-        # 3. Post-process masks for loss calculation
-        # We need to upscale low_res_masks to original size to compare with GT
-        masks = F.interpolate(
-            low_res_masks,
-            size=(h, w),
-            mode="bilinear",
-            align_corners=False
+
+        logits_ref1_t = torch.as_tensor(logits_ref1[0][None, ...], device=self.device)
+
+        mask_bool = masks_ref1[0].astype(bool)
+        ys, xs = np.nonzero(mask_bool)
+        if xs.size and ys.size:
+            x_min, x_max, y_min, y_max = xs.min(), xs.max(), ys.min(), ys.max()
+            input_box = np.array([[x_min, y_min, x_max, y_max]], dtype=np.float32)
+        else:
+            input_box = None
+
+        masks_ref2, scores_ref2, logits_ref2 = self.predictor.predict(
+            point_coords=auto_point_coords.cpu().numpy(),
+            point_labels=auto_point_labels.cpu().numpy(),
+            box=input_box if input_box is not None else None,
+            mask_input=logits_ref1_t.cpu().numpy(),
+            multimask_output=True,
         )
+
+        return masks_ref2, scores_ref2, logits_ref2
+
+    def extract_visual_prompt(self, ref_features: Dict[str, torch.Tensor], ref_mask: torch.Tensor) -> torch.Tensor:
+        features = ref_features["image_embed"]
+        if features.dim() == 3:
+            features = features.unsqueeze(0)
+        B, C, Hf, Wf = features.shape
+
+        mask = F.interpolate(ref_mask.float(), size=(Hf, Wf), mode="bilinear", align_corners=False)
+        if mask.dim() == 3:
+            mask = mask.unsqueeze(1)
+        mask = (mask > 0.5).float()
+
+        masked = features * mask
+        area = mask.sum(dim=[2, 3], keepdim=True)
+        mean_feat = masked.sum(dim=[2, 3], keepdim=True) / (area + 1e-6)
+
+        min_val = masked.min() - 1.0
+        masked_for_max = masked.clone()
+        masked_for_max[mask.repeat(1, C, 1, 1) == 0] = min_val
+        max_feat = masked_for_max.amax(dim=[2, 3], keepdim=True)
+
+        alpha, beta = 1.0, 0.0
+        prompt = alpha * mean_feat + beta * max_feat
+        prompt_flat = prompt.view(B, C)
+        prompt_norm = F.normalize(prompt_flat, p=2, dim=1).view(B, C, 1, 1)
+        return prompt_norm
+
+    def cal_point(self, test_features: Dict[str, torch.Tensor],
+                                           visual_prompt: torch.Tensor,
+                                           original_image_size: Tuple[int, int]):
+        device = test_features["image_embed"].device
+        B, C, Hf, Wf = test_features["image_embed"].shape
+        orig_h, orig_w = original_image_size
+
+        test_feat = F.normalize(test_features["image_embed"], p=2, dim=1)
+        prompt_vec = visual_prompt
+        if prompt_vec.dim() == 4:
+            prompt_vec = prompt_vec.view(B, C)
+        prompt_vec = F.normalize(prompt_vec, p=2, dim=1)
+
+        n_clusters = max(1, int(getattr(self, "num_prompt_clusters", 1)))
+        clustered_prompts = []
+        if n_clusters > 1:
+            for b in range(B):
+                if self.ref_feats_for_clustering is None:
+                    base = prompt_vec[b].unsqueeze(0).repeat(Hf * Wf, 1)
+                    samples = (base + 0.001 * torch.randn_like(base, device=device)).cpu().numpy()
+                else:
+                    feat_b = self.ref_feats_for_clustering[b]  # [Hf, Wf, C]
+                    mask_b = self.ref_mask_for_clustering[b]
+                    samples = feat_b[mask_b].cpu().numpy()
+                    if samples.shape[0] < n_clusters:
+                        base = prompt_vec[b].unsqueeze(0).repeat(Hf * Wf, 1)
+                        samples = (base + 0.001 * torch.randn_like(base, device=device)).cpu().numpy()
+                kmeans = KMeans(n_clusters=n_clusters, random_state=0).fit(samples)
+                centers = torch.tensor(kmeans.cluster_centers_, device=device, dtype=prompt_vec.dtype)
+                centers = F.normalize(centers, p=2, dim=1)
+                clustered_prompts.append(centers.unsqueeze(0))
+            prompt_multi = torch.cat(clustered_prompts, dim=0)  # [B, n_clusters, C]
+        else:
+            prompt_multi = prompt_vec.unsqueeze(1)  # [B,1,C]
+
+        sim_list = []
+        for k in range(prompt_multi.shape[1]):
+            p = prompt_multi[:, k, :].view(B, C, 1, 1)
+            sim = F.cosine_similarity(test_feat, p, dim=1)
+            sim_list.append(sim.unsqueeze(1))
+        sim_map = torch.cat(sim_list, dim=1)  # [B, n_clusters, Hf, Wf]
+
+        if getattr(self, "cluster_agg_method", "mean") == "max":
+            sim_agg = sim_map.max(dim=1)[0]
+        else:
+            sim_agg = sim_map.mean(dim=1)
+
+        sim_up_multi = F.interpolate(sim_map, size=(orig_h, orig_w), mode="bilinear", align_corners=False)
+        sim_up_agg = F.interpolate(sim_agg.unsqueeze(1), size=(orig_h, orig_w), mode="bilinear", align_corners=False).squeeze(1)
+
+        auto_coords = []
+        auto_labels = []
+        for b in range(B):
+            h, w = sim_up_agg[b].shape
+            batch_coords = []
+            batch_labels = []
+
+            for k in range(sim_up_multi.shape[1]):
+                sim_k = sim_up_multi[b, k]
+                flat_k = sim_k.flatten()
+                pos_idx = torch.argmax(flat_k)
+                pos_y, pos_x = divmod(int(pos_idx.item()), w)
+                pos_x = float(max(0, min(w - 1, pos_x)))
+                pos_y = float(max(0, min(h - 1, pos_y)))
+                batch_coords.append([pos_x, pos_y])
+                batch_labels.append(1)
+
+            flat_g = sim_up_agg[b].flatten()
+            neg_idx = torch.argmin(flat_g)
+            neg_y, neg_x = divmod(int(neg_idx.item()), w)
+            neg_x = float(max(0, min(w - 1, neg_x)))
+            neg_y = float(max(0, min(h - 1, neg_y)))
+            batch_coords.append([neg_x, neg_y])
+            batch_labels.append(0)
+
+            coords = torch.tensor(batch_coords, device=device, dtype=torch.float32).unsqueeze(0)
+            labels = torch.tensor(batch_labels, device=device, dtype=torch.long).unsqueeze(0)
+            auto_coords.append(coords)
+            auto_labels.append(labels)
+
+        auto_point_coords = torch.cat(auto_coords, dim=0)
+        auto_point_labels = torch.cat(auto_labels, dim=0)
+
+        return auto_point_coords, auto_point_labels
+    def save_vis(self,
+                           image: np.ndarray,
+                           mask: np.ndarray,
+                           output_path: str,
+                           pos_icon_path: str = "icon/click3.png",
+                           neg_icon_path: str = "icon/click4.png"):
         
-        # Select the best mask if multimask output (simplified: often index 0 or 1 is best in PerSAM)
-        # For stability in training, we often take the one with highest initial score or just all.
-        # Here we simplify by taking the best matching mask to GT for loss to avoid mode collapse issues.
-        # A simple robust way is to use the mask that is most confident or just average loss over plausible masks.
-        # Let's use the first mask for simplicity in this minimal implementation, or best IoU.
-        # Standard SAM usually puts best single-object mask at index 0 when multimask=False, 
-        # but with multimask=True it returns 3. Let's use the one that matches GT best to optimize.
-        
-        # (Optional refined selection could go here, using simple index 0 for this example)
-        main_mask_logits = masks[:, 0, :, :] 
+        if self.last_points is None or self.last_labels is None:
+            print(f"Warning: 'predict()' must be called before 'save_vis()'. "
+                  f"Skipping visualization for {output_path}")
+            return
+        overlay_img = image.copy()
+        alpha = 0.5
+        overlay_img[mask > 0] = (alpha * np.array([0, 255, 0]) + (1 - alpha) * overlay_img[mask > 0])
 
-        # [cite_start]4. Calculate Loss [cite: 16]
-        dice_loss = calculate_dice_loss(main_mask_logits, gt_mask)
-        focal_loss = calculate_sigmoid_focal_loss(main_mask_logits, gt_mask)
-        loss = dice_loss + focal_loss
+        pos_icon = cv2.imread(pos_icon_path, cv2.IMREAD_UNCHANGED) if os.path.exists(pos_icon_path) else None
+        neg_icon = cv2.imread(neg_icon_path, cv2.IMREAD_UNCHANGED) if os.path.exists(neg_icon_path) else None
 
-        loss.backward()
-        optimizer.step()
+        overlay = overlay_img.copy()
+        points = self.last_points[0]
+        labels = self.last_labels[0]
 
-        if i % 200 == 0:
-             print(f"Iter {i}: Loss={loss.item():.4f} (Dice={dice_loss.item():.4f}, Focal={focal_loss.item():.4f})")
+        for i in range(points.shape[0]):
+            x = int(points[i, 0].item())
+            y = int(points[i, 1].item())
+            label = labels[i].item()
+            icon_to_draw = pos_icon if label == 1 else neg_icon
+            if icon_to_draw is None:
+                continue
 
-    print("======> Fine-tuning complete.")
-    return finetuned_prompt.detach() # Lock the prompt 
+            new_size = (64, 64)
+            icon_to_draw = cv2.resize(icon_to_draw, new_size, interpolation=cv2.INTER_AREA)
 
-# --- Phase 3: Fast Inference ---
-    # output_path: str = None
-def inference_persam2_f(
-    auto_predictor: PerSAM2AutomaticPredictor,
-    test_image: np.ndarray,
-    finetuned_prompt: torch.Tensor,
-    vis_output_path: str = None,
-    mask_output_path: str = None
+            ih, iw = icon_to_draw.shape[:2]
+            y1 = max(0, y - ih // 2)
+            y2 = min(image.shape[0], y + (ih - ih // 2))
+            x1 = max(0, x - iw // 2)
+            x2 = min(image.shape[1], x + (iw - iw // 2))
 
-):
-    original_prompt = auto_predictor.visual_prompt
-    auto_predictor.visual_prompt = finetuned_prompt
+            icon_y1 = (ih // 2) - (y - y1)
+            icon_y2 = (ih // 2) + (y2 - y)
+            icon_x1 = (iw // 2) - (x - x1)
+            icon_x2 = (iw // 2) + (x2 - x)
 
-    # Run prediction
-    masks, scores, logits = auto_predictor.predict(test_image)
+            icon_resized = icon_to_draw[icon_y1:icon_y2, icon_x1:icon_x2]
 
-    # Restore original prompt just in case
-    auto_predictor.visual_prompt = original_prompt
+            if icon_resized.shape[2] == 4:
+                alpha_icon = icon_resized[:, :, 3] / 255.0
+                for c in range(3):
+                    overlay[y1:y2, x1:x2, c] = (
+                        alpha_icon * icon_resized[:, :, c] + (1 - alpha_icon) * overlay[y1:y2, x1:x2, c]
+                    )
+            else:
+                overlay[y1:y2, x1:x2] = icon_resized[:, :, :3]
 
-    # modified 
-    best_idx = np.argmax(scores)
-    final_mask = masks[best_idx]
-
-    if vis_output_path:
-        plt.figure(figsize=(10, 10))
-        plt.imshow(test_image)
-        show_mask(final_mask, plt.gca())
-        plt.axis('off')
-        plt.savefig(vis_output_path, bbox_inches='tight', pad_inches=0)
+        plt.figure(figsize=(8, 8))
+        plt.imshow(overlay.astype(np.uint8))
+        plt.axis("off")
+        plt.savefig(output_path, bbox_inches="tight", pad_inches=0)
         plt.close()
-    if mask_output_path:
-        masks_uint8=(final_mask * 255).astype(np.uint8)
-        cv2.imwrite(mask_output_path,masks_uint8)
 
+
+def inference(auto_pointer: AutomaticPointor,
+                       test_image: np.ndarray,
+                       vis_output_path: str = None,
+                       mask_output_path: str = None
+                       ):
+    masks, scores, logits = auto_pointer.predict(test_image)
+    best_idx = int(np.argmax(scores))
+    final_mask = masks[best_idx]
+    # sav vis
+    if vis_output_path:
+        auto_pointer.save_vis(
+            image=test_image,
+            mask=final_mask,
+            output_path=vis_output_path
+        )
+
+    if mask_output_path:
+        masks_uint8 = (final_mask * 255).astype(np.uint8)
+        cv2.imwrite(mask_output_path, masks_uint8)
 
     return masks, scores
 
-# --- Utils for visualization ---
-def show_mask(mask, ax, random_color=False):
-    if random_color:
-        color = np.concatenate([np.random.random(3), np.array([0.6])], axis=0)
-    else:
-        color = np.array([30/255, 144/255, 255/255, 0.6])
-    h, w = mask.shape[-2:]
-    mask_image = mask.reshape(h, w, 1) * color.reshape(1, 1, -1)
-    ax.imshow(mask_image)
-
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Run PerSAM2 Fine-tuning on a flat folder structure.")
-    parser.add_argument("--sam2_checkpoint", type=str, required=True, help="Path to SAM2 checkpoint.")
+    parser = argparse.ArgumentParser(description="Run PerSAM2 Fine-tuning on PerSeg dataset structure.")
+    parser.add_argument("--sam2_checkpoint", type=str, default="checkpoints/sam2.1_hiera_large.pt", help="Path to SAM2 checkpoint.")
     parser.add_argument("--model_cfg", type=str, default="configs/sam2.1/sam2.1_hiera_l.yaml", help="SAM2 config.")
-    parser.add_argument("--data_dir", type=str, required=True, help="Directory containing images and masks.")
-    parser.add_argument("--obj_prefix", type=str, required=True, help="Prefix for the object (e.g., 'cat').")
+    parser.add_argument("--data_root", type=str, default="./data", help="Root containing Images/ and Annotations/ folders.")
+    parser.add_argument("--class_name", type=str, default=None, help="Specific class to run. If None, runs all found classes.")
     parser.add_argument("--ref_idx", type=str, default="00", help="Index of reference image (e.g., '00').")
-    parser.add_argument("--iterations", type=int, default=1000, help="Fine-tuning iterations.")
     parser.add_argument("--output_dir", type=str, default="./outputs", help="Where to save results.")
+    parser.add_argument("--num_prompt_clusters", type=int, default=1,help="cluster on reference-level")
 
     args = parser.parse_args()
 
-    # Setup paths based on your structure: examples/cat_00.jpg
-    ref_img_name = f"{args.obj_prefix}_{args.ref_idx}.jpg"
-    ref_mask_name = f"{args.obj_prefix}_{args.ref_idx}.png"
-    ref_img_path = os.path.join(args.data_dir, ref_img_name)
-    ref_mask_path = os.path.join(args.data_dir, ref_mask_name)
+    images_root = os.path.join(args.data_root, "Images")
+    if args.class_name:
+        classes = [args.class_name]
+    else:
+        classes = sorted([d for d in os.listdir(images_root) if os.path.isdir(os.path.join(images_root, d))])
+        print(f"======> Automatically found {len(classes)} classes: {classes}")
 
-    if not os.path.exists(ref_img_path) or not os.path.exists(ref_mask_path):
-        raise FileNotFoundError(f"Could not find reference files:\n{ref_img_path}\n{ref_mask_path}")
+    for class_idx, class_name in enumerate(classes):
+        print(f"\n\n[{class_idx+1}/{len(classes)}] Processing Class: ===> {class_name} <===")
+        
+        img_dir = os.path.join(args.data_root, "Images", class_name)
+        mask_dir = os.path.join(args.data_root, "Annotations", class_name)
+        ref_img_name = f"{args.ref_idx}.jpg"
+        ref_mask_name = f"{args.ref_idx}.png"
+        ref_img_path = os.path.join(img_dir, ref_img_name)
+        ref_mask_path = os.path.join(mask_dir, ref_mask_name)
 
-    # 1. Initialize
-    print(f"======> Initializing SAM2 for object: {args.obj_prefix}")
-    persam = PerSAM2AutomaticPredictor(args.sam2_checkpoint, args.model_cfg)
-    
-    # 2. Load Reference
-    print(f"======> Loading reference: {ref_img_name}")
-    ref_img = cv2.cvtColor(cv2.imread(ref_img_path), cv2.COLOR_BGR2RGB)
-    ref_mask = cv2.imread(ref_mask_path, cv2.IMREAD_GRAYSCALE)
+        if not os.path.exists(ref_img_path) or not os.path.exists(ref_mask_path):
+            print(f"Skipping {class_name}: Reference files not found ({ref_img_name}/{ref_mask_name})")
+            continue
 
-    # 3. Fine-tune
-    finetuned_prompt = train_persam2_f(persam, ref_img, ref_mask, iterations=args.iterations)
+        print(f"--> Initializing SAM2 for {class_name}...")
+        persam = AutomaticPointor(args.sam2_checkpoint, args.model_cfg)
 
-    # 4. Inference on all matching images in the folder
-    output_dir = os.path.join(args.output_dir, args.obj_prefix)
-    os.makedirs(output_dir, exist_ok=True)
+        print(f"--> Loading reference: {os.path.join(class_name, ref_img_name)}")
+        ref_img = cv2.cvtColor(cv2.imread(ref_img_path), cv2.COLOR_BGR2RGB)
+        ref_mask = cv2.imread(ref_mask_path, cv2.IMREAD_GRAYSCALE)
 
-    # Find all images matching the prefix (e.g., cat_*.jpg)
-    test_images = sorted(glob.glob(os.path.join(args.data_dir, f"{args.obj_prefix}_*.jpg")))
-    
-    print(f"======> Found {len(test_images)} images. Starting inference...")
-    for test_path in tqdm(test_images):
-        img_name = os.path.basename(test_path)
-        if img_name == ref_img_name: continue # Skip reference
+        print(f"--> Setting reference (One-shot)...")
+        persam.set_reference(ref_img, ref_mask)
 
-        test_img = cv2.cvtColor(cv2.imread(test_path), cv2.COLOR_BGR2RGB)
-        # out_path = os.path.join(output_dir, img_name.replace(".jpg", "_pred.jpg"))
-        # masks,scores = inference_persam2_f(persam, test_img, finetuned_prompt, output_path=vis_path)
-        base_name = os.path.splitext(img_name)[0]
-        vis_path = os.path.join(output_dir,base_name + "_vis.jpg")
-        mask_path =  os.path.join(output_dir,base_name + ".png")
-        inference_persam2_f(
-            persam,
-            test_img,
-            finetuned_prompt,
-            vis_output_path = vis_path,
-            mask_output_path = mask_path
-        )
+        output_class_dir = os.path.join(args.output_dir, class_name)
+        os.makedirs(output_class_dir, exist_ok=True)
 
-    print(f"Done! Results saved to {output_dir}")
+        test_images = sorted(glob.glob(os.path.join(img_dir, "*.jpg")))
+        print(f"--> Found {len(test_images)} images. Starting inference for {class_name}...")
+
+        for test_path in tqdm(test_images, desc=f"Inference ({class_name})"):
+            img_name = os.path.basename(test_path)
+            if img_name == ref_img_name: continue
+
+            test_img = cv2.cvtColor(cv2.imread(test_path), cv2.COLOR_BGR2RGB)
+
+            base_name = os.path.splitext(img_name)[0]
+            vis_path = os.path.join(output_class_dir, base_name + "_vis.jpg")
+            mask_path = os.path.join(output_class_dir, base_name + ".png")
+
+            inference(
+                persam, 
+                test_img, 
+                vis_output_path=vis_path, 
+                mask_output_path=mask_path
+            )
+
+    print("\n======> All classes processed.")

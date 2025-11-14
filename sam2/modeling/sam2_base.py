@@ -261,6 +261,8 @@ class SAM2Base(torch.nn.Module):
         mask_inputs=None,
         high_res_features=None,
         multimask_output=False,
+        attn_sim=None,  # new
+        target_embedding=None  # new
     ):
         """
         Forward SAM prompt encoders and mask heads.
@@ -355,6 +357,8 @@ class SAM2Base(torch.nn.Module):
             multimask_output=multimask_output,
             repeat_image=False,  # the image is already batched
             high_res_features=high_res_features,
+            attn_sim=attn_sim,                     # new
+            target_embedding=target_embedding,     # new
         )
         if self.pred_obj_scores:
             is_obj_appearing = object_score_logits > 0
