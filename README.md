@@ -7,4 +7,3 @@ Peak locations become positive points, plus one negative point, forming an autom
 - K-Means on dense foreground features
 - Multi-peak similarity → automatic multi-point prompts
 - No training required
-- Clean and minimal codebase
