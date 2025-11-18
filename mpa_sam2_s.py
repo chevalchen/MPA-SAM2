@@ -19,7 +19,7 @@ from sam2.sam2_image_predictor import SAM2ImagePredictor
 
 class MPASAM2:
     """
-    Minimal, cleaned and unified PerSAM2:
+    Mutil-Peak Autopointer for SAM2:
     - single extraction of foreground features from reference
     - produce: dense_fg_feats (list of [N,C]), prompt_centers [B,K,C,1,1], mean target_embedding [B,1,C]
     - similarity computed from dense_fg_feats -> multi-peak maps
