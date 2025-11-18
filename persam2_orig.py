@@ -1,20 +1,7 @@
-'''
-在persam2_ori.py的基础上，修改了自动点选模块，使其支持多峰参考特征的聚类表示。
-主要修改点包括：
-1. 在set_reference方法中，提取参考图像的特征时，使用
-KMeans对前景特征进行聚类，得到多个中心点作为视觉提示。
-2. 在predict方法中，计算测试图像与参考特征的相似度时，使用参考图像的所有前景特征进行相似度计算，并对相似度进行聚合。
-3. 修改了cal_point方法，使其能够处理多个视觉提示，并为每个提示选择一个正点，同时选择一个全局负点。
-说明（关键代码修改点）
-target_feat 改为 list，每个元素是参考前景所有像素的 normalized feature [N, C]。在 predict() 中用矩阵乘法得到 [N, Hf*Wf]，再对 N 做 mean（或可改为 max）来保持多峰响应。此处保留 mean，稳定且能覆盖多个部件。
-target_embedding 仍保留 [B,1,C]（mean），以兼容 predictor.predict(..., target_embedding=...) 的 API。
-visual_prompt 改为多中心 [B, K, C, 1, 1]，使用 KMeans 在前景像素上生成 1~4 个中心（按前景像素数量自适应），并在 cal_point() 中对每个中心取 argmax 产生多个正点。
-修复了 prompt/reshape 的错误取法与 torch.bmm 传入 list 导致的异常。
-''' 
 import os
 import glob
 import argparse
-from typing import Dict, Optional, Tuple, List
+from typing import Dict, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -33,17 +20,15 @@ class AutomaticPointor:
         self.predictor = SAM2ImagePredictor(self.model)
         self.device = device or self.model.device
         self.model.eval()
-        # --- modified: store visual_prompt and target_feat differently to keep multi-peak info
-        self.visual_prompt: Optional[torch.Tensor] = None        # [B, K, C, 1, 1]
+        self.visual_prompt: Optional[torch.Tensor] = None
         self.ref_feats_for_clustering: Optional[torch.Tensor] = None
         self.ref_mask_for_clustering: Optional[torch.Tensor] = None
         self.num_prompt_clusters = 1
         self.cluster_agg_method = "mean"
         self.last_points: Optional[torch.Tensor] = None
         self.last_labels: Optional[torch.Tensor] = None
-        # target_embedding: keep [B,1,C] for predictor API; target_feat: list per batch of dense [N, C] for sim
-        self.target_embedding : Optional[torch.Tensor] = None   # [B,1,C]
-        self.target_feat : Optional[List[torch.Tensor]] = None  # list of length B, each [N, C]
+        self.target_embedding : Optional[torch.Tensor] = None
+        self.target_feat : Optional[torch.Tensor] = None
 
     def set_reference(self, ref_image: np.ndarray, ref_mask: np.ndarray) -> None:
         self.predictor.set_image(ref_image)
@@ -59,40 +44,30 @@ class AutomaticPointor:
         if feats.dim() == 3:
             feats = feats.unsqueeze(0)
         Bf, C, Hf, Wf = feats.shape
-        # --- modified: keep ref_feats_for_clustering for later cluster sampling
-        self.ref_feats_for_clustering = feats.permute(0, 2, 3, 1).detach()  # [B, Hf, Wf, C]
+        self.ref_feats_for_clustering = feats.permute(0, 2, 3, 1).detach()
         mask_feat = F.interpolate(processed_mask.float(), size=(Hf, Wf), mode="bilinear", align_corners=False)
-        self.ref_mask_for_clustering = (mask_feat > 0.5).squeeze(1).bool().detach()  # [B, Hf, Wf]
+        self.ref_mask_for_clustering = (mask_feat > 0.5).squeeze(1).bool().detach()
         b, hf, wf, c = self.ref_feats_for_clustering.shape
-
-        # --- modified: build dense per-pixel target_feat list and mean target_embedding
-        dense_embeddings = []
-        mean_embeddings = []
+        target_embeddings = []
         for i in range(b):
             feat_b = self.ref_feats_for_clustering[i]  # [Hf, Wf, C]
             mask_b = self.ref_mask_for_clustering[i]  # [Hf, Wf]
-            target_feat_pixels = feat_b[mask_b]       # [N, C]
+            
+            target_feat_pixels = feat_b[mask_b] # [N, C]
             if target_feat_pixels.shape[0] == 0:
-                # fallback: use all pixels
-                target_feat_pixels = feat_b.reshape(-1, c)
+                target_embedding_b = feat_b.mean([0, 1]).unsqueeze(0) # [1, C]
+            else:
+                target_embedding_b = target_feat_pixels.mean(0).unsqueeze(0) # [1, C]
+            
+            target_embeddings.append(target_embedding_b)
+        
+        self.target_embedding = torch.cat(target_embeddings, dim=0).unsqueeze(1) # [B, 1, C]
 
-            # normalize per-vector and keep dense list (N, C)
-            target_feat_pixels = F.normalize(target_feat_pixels, p=2, dim=1).detach()
-            dense_embeddings.append(target_feat_pixels)
-
-            # keep mean for predictor API but do not use it for sim aggregation directly
-            mean_emb = target_feat_pixels.mean(0, keepdim=True)  # [1, C]
-            mean_embeddings.append(mean_emb)
-
-        # store
-        self.target_feat = dense_embeddings                     # list of [N, C]
-        self.target_embedding = torch.cat(mean_embeddings, dim=0).unsqueeze(1).to(self.device)  # [B,1,C]
-
-        # --- modified: extract visual_prompt as multi-centroid prompts [B, K, C, 1, 1]
         self.visual_prompt = self.extract_visual_prompt(ref_features, processed_mask)
+        self.target_feat = self.target_embedding 
 
     def predict(self, test_image: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        if self.visual_prompt is None or self.target_feat is None:
+        if self.visual_prompt is None:
             raise ValueError("Reference not set. Call set_reference() first.")
         self.predictor.set_image(test_image)
         cached_features = self.predictor._features
@@ -100,45 +75,32 @@ class AutomaticPointor:
         test_feat_embed = cached_features["image_embed"] # [B, C, Hf, Wf]
         b, c, hf, wf = test_feat_embed.shape
 
-        # normalize test features for cosine similarity
-        norm_test_feat = F.normalize(test_feat_embed, p=2, dim=1)  # [B, C, Hf, Wf]
-        norm_test_feat_flat = norm_test_feat.view(b, c, hf * wf)   # [B, C, Hf*Wf]
+        norm_test_feat = F.normalize(test_feat_embed, p=2, dim=1)
+        norm_test_feat_flat = norm_test_feat.view(b, c, hf * wf) # [B, C, Hf*Wf]
 
-        # --- modified: compute similarity using dense reference features (list) and aggregate across ref pixels
-        sim_list = []
-        for bi in range(b):
-            ref_dense = self.target_feat[bi]          # [N, C]
-            test_b_flat = norm_test_feat_flat[bi]    # [C, Hf*Wf]
-            # matmul: [N, C] x [C, Hf*Wf] -> [N, Hf*Wf]
-            sim_dense = torch.matmul(ref_dense, test_b_flat)      # [N, Hf*Wf]
-            # aggregate over N (ref pixels): mean (keeps multi-peak behavior)
-            sim_agg = sim_dense.mean(0)                           # [Hf*Wf]
-            sim_agg = sim_agg.view(1, 1, hf, wf)                  # [1,1,Hf,Wf]
-            sim_list.append(sim_agg)
-        sim = torch.cat(sim_list, dim=0)  # [B,1,Hf,Wf]
-
-        # upsample and postprocess to image size
+        sim = torch.bmm(self.target_feat, norm_test_feat_flat) # [B, 1, Hf*Wf]
+        sim = sim.view(b, 1, hf, wf) # [B, 1, Hf, Wf]
         sim_up = self.predictor._transforms.postprocess_masks(
             sim,
             orig_hw=orig_hw,
         )  # [B,1,H,W]
 
-        sim_orig = sim_up.squeeze(1)  # [B, H, W]
+        sim_orig = sim_up.squeeze(1)
 
-        # build attn_sim similar to original (used for attention guidance)
         attn_sim_list = []
         for i in range(b):
             sim_b = sim_orig[i] # [orig_h, orig_w]
             sim_std = torch.std(sim_b)
-            if sim_std == 0:
+            if sim_std == 0: 
                 sim_std = 1.0
             sim_b = (sim_b - sim_b.mean()) / sim_std
             sim_b_64 = F.interpolate(sim_b.unsqueeze(0).unsqueeze(0), size=(64, 64), mode="bilinear")
-            attn_sim_b = sim_b_64.sigmoid_().unsqueeze(0).flatten(3)
+            # [1, 1, 4096]
+            attn_sim_b = sim_b_64.sigmoid_().unsqueeze(0).flatten(3) 
             attn_sim_list.append(attn_sim_b)
-        attn_sim = torch.cat(attn_sim_list, dim=0)  # [B, 1, 4096] or similar
+        
+        attn_sim = torch.cat(attn_sim_list, dim=0) # [B, 1, 4096]
 
-        # auto point coords / labels using cal_point (cal_point uses visual_prompt multi-centroids)
         auto_point_coords, auto_point_labels = self.cal_point(
             cached_features, self.visual_prompt, orig_hw
         )
@@ -146,13 +108,12 @@ class AutomaticPointor:
         self.last_points = auto_point_coords.clone()
         self.last_labels = auto_point_labels.clone()
 
-        # call predictor with multimodal guidance
         masks, scores, logits = self.predictor.predict(
             point_coords=auto_point_coords,
             point_labels=auto_point_labels,
             multimask_output=True,
             attn_sim=attn_sim,
-            target_embedding=self.target_embedding  # keep mean for predictor
+            target_embedding=self.target_embedding
         )
 
         best_idx = int(np.argmax(scores))
@@ -186,10 +147,6 @@ class AutomaticPointor:
         return masks_ref2, scores_ref2, logits_ref2
 
     def extract_visual_prompt(self, ref_features: Dict[str, torch.Tensor], ref_mask: torch.Tensor) -> torch.Tensor:
-        """
-        Modified: return multi-centroid visual prompts of shape [B, K, C, 1, 1]
-        Each centroid represents a mode (component) in the reference foreground.
-        """
         features = ref_features["image_embed"]
         if features.dim() == 3:
             features = features.unsqueeze(0)
@@ -198,90 +155,82 @@ class AutomaticPointor:
         mask = F.interpolate(ref_mask.float(), size=(Hf, Wf), mode="bilinear", align_corners=False)
         if mask.dim() == 3:
             mask = mask.unsqueeze(1)
-        mask = (mask > 0.5).float().squeeze(1)  # [B, Hf, Wf]
+        mask = (mask > 0.5).float()
 
-        prompts_per_batch = []
-        for i in range(B):
-            feat = features[i].permute(1, 2, 0)  # [Hf, Wf, C]
-            fg_feat = feat[mask[i].bool()]       # [N, C]
-            if fg_feat.shape[0] == 0:
-                # fallback to global mean
-                center = features[i].view(C, -1).mean(1, keepdim=True).T  # [1, C]
-                centers = center
-            else:
-                # number of centers adaptive to foreground size, clamp in [1,4]
-                n_centers = int(min(max(1, fg_feat.shape[0] // 200), 4))
-                if n_centers <= 1:
-                    centers = fg_feat.mean(0, keepdim=True)  # [1, C]
-                else:
-                    kmeans = KMeans(n_clusters=n_centers, random_state=0).fit(
-                        fg_feat.cpu().numpy()
-                    )
-                    centers = torch.tensor(kmeans.cluster_centers_, dtype=features.dtype, device=features.device)  # [K, C]
+        masked = features * mask
+        area = mask.sum(dim=[2, 3], keepdim=True)
+        mean_feat = masked.sum(dim=[2, 3], keepdim=True) / (area + 1e-6)
 
-            centers = F.normalize(centers, p=2, dim=1)    # [K, C]
-            centers = centers.unsqueeze(-1).unsqueeze(-1)  # [K, C, 1, 1]
-            prompts_per_batch.append(centers)
+        min_val = masked.min() - 1.0
+        masked_for_max = masked.clone()
+        masked_for_max[mask.repeat(1, C, 1, 1) == 0] = min_val
+        max_feat = masked_for_max.amax(dim=[2, 3], keepdim=True)
 
-        # pad clusters to same K per batch if needed (choose max K)
-        max_k = max([p.shape[0] for p in prompts_per_batch])
-        padded_prompts = []
-        for p in prompts_per_batch:
-            k = p.shape[0]
-            if k < max_k:
-                # pad by repeating first center
-                pad = p[0:1].repeat(max_k - k, 1, 1, 1)
-                p = torch.cat([p, pad], dim=0)
-            padded_prompts.append(p)
-        prompt_tensor = torch.stack(padded_prompts, dim=0)  # [B, K, C, 1, 1]
-        return prompt_tensor
+        alpha, beta = 1.0, 0.0
+        prompt = alpha * mean_feat + beta * max_feat
+        prompt_flat = prompt.view(B, C)
+        prompt_norm = F.normalize(prompt_flat, p=2, dim=1).view(B, C, 1, 1)
+        return prompt_norm
 
     def cal_point(self, test_features: Dict[str, torch.Tensor],
-                  visual_prompt: torch.Tensor,
-                  original_image_size: Tuple[int, int]):
-        """
-        Modified cal_point to accept visual_prompt [B, K, C, 1, 1]
-        and compute per-cluster argmax to produce multiple positive points and one negative.
-        """
+                                           visual_prompt: torch.Tensor,
+                                           original_image_size: Tuple[int, int]):
         device = test_features["image_embed"].device
         B, C, Hf, Wf = test_features["image_embed"].shape
         orig_h, orig_w = original_image_size
 
-        test_feat = F.normalize(test_features["image_embed"], p=2, dim=1)  # [B, C, Hf, Wf]
+        test_feat = F.normalize(test_features["image_embed"], p=2, dim=1)
+        prompt_vec = visual_prompt
+        if prompt_vec.dim() == 4:
+            prompt_vec = prompt_vec.view(B, C)
+        prompt_vec = F.normalize(prompt_vec, p=2, dim=1)
 
-        # visual_prompt expected [B, K, C, 1, 1]
-        prompt_multi = visual_prompt.to(device)  # [B, K, C, 1, 1]
-        num_clusters = prompt_multi.shape[1]
-
-        # compute similarity maps for each cluster centroid
-        sim_list = []
-        for k in range(num_clusters):
-            p = prompt_multi[:, k]            # [B, C, 1, 1]
-            sim = F.cosine_similarity(test_feat, p, dim=1)  # [B, Hf, Wf]
-            sim_list.append(sim.unsqueeze(1))
-        sim_map = torch.cat(sim_list, dim=1)  # [B, K, Hf, Wf]
-
-        # aggregate across clusters for a global map used for negative selection (mean or max)
-        if getattr(self, "cluster_agg_method", "mean") == "max":
-            sim_agg = sim_map.max(dim=1)[0]  # [B, Hf, Wf]
+        n_clusters = max(1, int(getattr(self, "num_prompt_clusters", 1)))
+        clustered_prompts = []
+        if n_clusters > 1:
+            for b in range(B):
+                if self.ref_feats_for_clustering is None:
+                    base = prompt_vec[b].unsqueeze(0).repeat(Hf * Wf, 1)
+                    samples = (base + 0.001 * torch.randn_like(base, device=device)).cpu().numpy()
+                else:
+                    feat_b = self.ref_feats_for_clustering[b]  # [Hf, Wf, C]
+                    mask_b = self.ref_mask_for_clustering[b]
+                    samples = feat_b[mask_b].cpu().numpy()
+                    if samples.shape[0] < n_clusters:
+                        base = prompt_vec[b].unsqueeze(0).repeat(Hf * Wf, 1)
+                        samples = (base + 0.001 * torch.randn_like(base, device=device)).cpu().numpy()
+                kmeans = KMeans(n_clusters=n_clusters, random_state=0).fit(samples)
+                centers = torch.tensor(kmeans.cluster_centers_, device=device, dtype=prompt_vec.dtype)
+                centers = F.normalize(centers, p=2, dim=1)
+                clustered_prompts.append(centers.unsqueeze(0))
+            prompt_multi = torch.cat(clustered_prompts, dim=0)  # [B, n_clusters, C]
         else:
-            sim_agg = sim_map.mean(dim=1)    # [B, Hf, Wf]
+            prompt_multi = prompt_vec.unsqueeze(1)  # [B,1,C]
 
-        # upsample maps to original image resolution
-        sim_up_multi = F.interpolate(sim_map, size=(orig_h, orig_w), mode="bilinear", align_corners=False)  # [B, K, H, W]
-        sim_up_agg = F.interpolate(sim_agg.unsqueeze(1), size=(orig_h, orig_w), mode="bilinear", align_corners=False).squeeze(1)  # [B, H, W]
+        sim_list = []
+        for k in range(prompt_multi.shape[1]):
+            p = prompt_multi[:, k, :].view(B, C, 1, 1)
+            sim = F.cosine_similarity(test_feat, p, dim=1)
+            sim_list.append(sim.unsqueeze(1))
+        sim_map = torch.cat(sim_list, dim=1)  # [B, n_clusters, Hf, Wf]
+
+        if getattr(self, "cluster_agg_method", "mean") == "max":
+            sim_agg = sim_map.max(dim=1)[0]
+        else:
+            sim_agg = sim_map.mean(dim=1)
+
+        sim_up_multi = F.interpolate(sim_map, size=(orig_h, orig_w), mode="bilinear", align_corners=False)
+        sim_up_agg = F.interpolate(sim_agg.unsqueeze(1), size=(orig_h, orig_w), mode="bilinear", align_corners=False).squeeze(1)
 
         auto_coords = []
         auto_labels = []
-
-        for b_idx in range(B):
-            h, w = sim_up_agg[b_idx].shape
+        for b in range(B):
+            h, w = sim_up_agg[b].shape
             batch_coords = []
             batch_labels = []
 
-            # for each cluster pick the highest response location (positive)
             for k in range(sim_up_multi.shape[1]):
-                sim_k = sim_up_multi[b_idx, k]
+                sim_k = sim_up_multi[b, k]
                 flat_k = sim_k.flatten()
                 pos_idx = torch.argmax(flat_k)
                 pos_y, pos_x = divmod(int(pos_idx.item()), w)
@@ -290,13 +239,14 @@ class AutomaticPointor:
                 batch_coords.append([pos_x, pos_y])
                 batch_labels.append(1)
 
-            # pick global negative (argmin on aggregated map)
-            flat_g = sim_up_agg[b_idx].flatten()
+            flat_g = sim_up_agg[b].flatten()
             neg_idx = torch.argmin(flat_g)
             ny = int(neg_idx // w)
-            nx = int(neg_idx % w)
-            neg_x = float(max(0, min(w - 1, nx)))
-            neg_y = float(max(0, min(h - 1, ny)))
+            nx = int(neg_idx %  w)
+            neg_y, neg_x = ny, nx
+
+            neg_x = float(max(0, min(w - 1, neg_x)))
+            neg_y = float(max(0, min(h - 1, neg_y)))
             batch_coords.append([neg_x, neg_y])
             batch_labels.append(0)
 
@@ -309,16 +259,16 @@ class AutomaticPointor:
         auto_point_labels = torch.cat(auto_labels, dim=0)
 
         return auto_point_coords, auto_point_labels
-
     def save_vis(self,
-                 image: np.ndarray,
-                 mask: np.ndarray,
-                 output_path: str,
-                 pos_icon_path: str = "icon/click3.png",
-                 neg_icon_path: str = "icon/click4.png"):
-
+                           image: np.ndarray,
+                           mask: np.ndarray,
+                           output_path: str,
+                           pos_icon_path: str = "icon/click3.png",
+                           neg_icon_path: str = "icon/click4.png"):
+        
         if self.last_points is None or self.last_labels is None:
-            print(f"Warning: 'predict()' must be called before 'save_vis()'. Skipping visualization for {output_path}")
+            print(f"Warning: 'predict()' must be called before 'save_vis()'. "
+                  f"Skipping visualization for {output_path}")
             return
         overlay_img = image.copy()
         alpha = 0.5
@@ -370,11 +320,12 @@ class AutomaticPointor:
         plt.savefig(output_path, bbox_inches="tight", pad_inches=0)
         plt.close()
 
+
 def inference(auto_pointer: AutomaticPointor,
-              test_image: np.ndarray,
-              vis_output_path: str = None,
-              mask_output_path: str = None
-              ):
+                       test_image: np.ndarray,
+                       vis_output_path: str = None,
+                       mask_output_path: str = None
+                       ):
     masks, scores, logits = auto_pointer.predict(test_image)
     best_idx = int(np.argmax(scores))
     final_mask = masks[best_idx]
@@ -400,7 +351,7 @@ if __name__ == "__main__":
     parser.add_argument("--class_name", type=str, default=None, help="Specific class to run. If None, runs all found classes.")
     parser.add_argument("--ref_idx", type=str, default="00", help="Index of reference image (e.g., '00').")
     parser.add_argument("--output_dir", type=str, default="./outputs", help="Where to save results.")
-    parser.add_argument("--num_prompt_clusters", type=int, default=1,help="cluster on reference-level")
+    parser.add_argument("--num_prompt_clusters", type=int, default=5,help="cluster on reference-level")
 
     args = parser.parse_args()
 
@@ -413,7 +364,7 @@ if __name__ == "__main__":
 
     for class_idx, class_name in enumerate(classes):
         print(f"\n\n[{class_idx+1}/{len(classes)}] Processing Class: ===> {class_name} <===")
-
+        
         img_dir = os.path.join(args.data_root, "Images", class_name)
         mask_dir = os.path.join(args.data_root, "Annotations", class_name)
         ref_img_name = f"{args.ref_idx}.jpg"
@@ -452,9 +403,9 @@ if __name__ == "__main__":
             mask_path = os.path.join(output_class_dir, base_name + ".png")
 
             inference(
-                persam,
-                test_img,
-                vis_output_path=vis_path,
+                persam, 
+                test_img, 
+                vis_output_path=vis_path, 
                 mask_output_path=mask_path
             )
 
