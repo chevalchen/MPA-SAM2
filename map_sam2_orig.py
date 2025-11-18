@@ -14,7 +14,6 @@ import matplotlib.pyplot as plt
 from sam2.build_sam import build_sam2
 from sam2.sam2_image_predictor import SAM2ImagePredictor
 
-
 class AutomaticPointor:
     def __init__(self, sam2_checkpoint: str, sam2_cfg: str, device: Optional[str] = None):
         self.model = build_sam2(sam2_cfg, sam2_checkpoint)
@@ -28,8 +27,7 @@ class AutomaticPointor:
         self.cluster_agg_method = "mean"
         self.last_points: Optional[torch.Tensor] = None
         self.last_labels: Optional[torch.Tensor] = None
-        # ---Add target embedding
-        self.target_embedding : Optional[torch.Tensor] = None,
+        self.target_embedding : Optional[torch.Tensor] = None
         self.target_feat : Optional[torch.Tensor] = None
 
     def set_reference(self, ref_image: np.ndarray, ref_mask: np.ndarray) -> None:
@@ -49,9 +47,6 @@ class AutomaticPointor:
         self.ref_feats_for_clustering = feats.permute(0, 2, 3, 1).detach()
         mask_feat = F.interpolate(processed_mask.float(), size=(Hf, Wf), mode="bilinear", align_corners=False)
         self.ref_mask_for_clustering = (mask_feat > 0.5).squeeze(1).bool().detach()
-        #
-        # ---Add
-        # --- This block is now the *only* place the mean feature is calculated ---
         b, hf, wf, c = self.ref_feats_for_clustering.shape
         target_embeddings = []
         for i in range(b):
@@ -66,18 +61,10 @@ class AutomaticPointor:
             
             target_embeddings.append(target_embedding_b)
         
-        # This is the unnormalized embedding for target-semantic prompting
         self.target_embedding = torch.cat(target_embeddings, dim=0).unsqueeze(1) # [B, 1, C]
 
-
-        # --- This part is calculated by the original persam2s function ---
         self.visual_prompt = self.extract_visual_prompt(ref_features, processed_mask)
-        # --- This line is new: Derive target_feat from visual_prompt ---
-        # self.visual_prompt is [B, C, 1, 1]
-        # We need self.target_feat to be [B, 1, C]
-        b, c, _, _ = self.visual_prompt.shape
-        self.target_feat = self.visual_prompt.view(b, c, -1).permute(0, 2, 1)
-        # ---END
+        self.target_feat = self.target_embedding 
 
     def predict(self, test_image: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         if self.visual_prompt is None:
@@ -85,30 +72,26 @@ class AutomaticPointor:
         self.predictor.set_image(test_image)
         cached_features = self.predictor._features
         orig_hw = self.predictor._orig_hw[0]
-        # <<< START OF ADDED CODE >>>
-        # Calculate attn_sim from persam.py logic
         test_feat_embed = cached_features["image_embed"] # [B, C, Hf, Wf]
         b, c, hf, wf = test_feat_embed.shape
 
-        # Normalize test features
         norm_test_feat = F.normalize(test_feat_embed, p=2, dim=1)
         norm_test_feat_flat = norm_test_feat.view(b, c, hf * wf) # [B, C, Hf*Wf]
 
-        # self.target_feat is [B, 1, C]
-        # Perform batched matrix multiplication for cosine similarity
         sim = torch.bmm(self.target_feat, norm_test_feat_flat) # [B, 1, Hf*Wf]
         sim = sim.view(b, 1, hf, wf) # [B, 1, Hf, Wf]
+        sim_up = self.predictor._transforms.postprocess_masks(
+            sim,
+            orig_hw=orig_hw,
+        )  # [B,1,H,W]
 
-        # Upsample sim map to original image size (like postprocess_masks)
-        sim_orig = F.interpolate(sim, size=orig_hw, mode="bilinear", align_corners=False)
-        sim_orig = sim_orig.squeeze(1) # [B, orig_h, orig_w]
+        sim_orig = sim_up.squeeze(1)
 
-        # Normalize and downsample to 64x64 for attn_sim
         attn_sim_list = []
         for i in range(b):
             sim_b = sim_orig[i] # [orig_h, orig_w]
             sim_std = torch.std(sim_b)
-            if sim_std == 0: # Avoid division by zero
+            if sim_std == 0: 
                 sim_std = 1.0
             sim_b = (sim_b - sim_b.mean()) / sim_std
             sim_b_64 = F.interpolate(sim_b.unsqueeze(0).unsqueeze(0), size=(64, 64), mode="bilinear")
@@ -116,32 +99,30 @@ class AutomaticPointor:
             attn_sim_b = sim_b_64.sigmoid_().unsqueeze(0).flatten(3) 
             attn_sim_list.append(attn_sim_b)
         
-        # Final attn_sim
         attn_sim = torch.cat(attn_sim_list, dim=0) # [B, 1, 4096]
-        # <<< END OF ADDED CODE >>>
 
         auto_point_coords, auto_point_labels = self.cal_point(
             cached_features, self.visual_prompt, orig_hw
         )
-        # for vis
-        self.last_points = auto_point_coords
-        self.last_labels = auto_point_labels
+
+        self.last_points = auto_point_coords.clone()
+        self.last_labels = auto_point_labels.clone()
 
         masks, scores, logits = self.predictor.predict(
-            point_coords=auto_point_coords.cpu().numpy(),
-            point_labels=auto_point_labels.cpu().numpy(),
+            point_coords=auto_point_coords,
+            point_labels=auto_point_labels,
             multimask_output=True,
             attn_sim=attn_sim,
             target_embedding=self.target_embedding
         )
 
         best_idx = int(np.argmax(scores))
-        best_logits = torch.as_tensor(logits[best_idx][None, ...], device=self.device)
+        best_logits = logits[best_idx][None, ...]
 
         masks_ref1, scores_ref1, logits_ref1 = self.predictor.predict(
-            point_coords=auto_point_coords.cpu().numpy(),
-            point_labels=auto_point_labels.cpu().numpy(),
-            mask_input=best_logits.cpu().numpy(),
+            point_coords=auto_point_coords,
+            point_labels=auto_point_labels,
+            mask_input=best_logits,
             multimask_output=True,
         )
 
@@ -156,10 +137,10 @@ class AutomaticPointor:
             input_box = None
 
         masks_ref2, scores_ref2, logits_ref2 = self.predictor.predict(
-            point_coords=auto_point_coords.cpu().numpy(),
-            point_labels=auto_point_labels.cpu().numpy(),
+            point_coords=auto_point_coords,
+            point_labels=auto_point_labels,
             box=input_box if input_box is not None else None,
-            mask_input=logits_ref1_t.cpu().numpy(),
+            mask_input=logits_ref1_t,
             multimask_output=True,
         )
 
@@ -260,7 +241,10 @@ class AutomaticPointor:
 
             flat_g = sim_up_agg[b].flatten()
             neg_idx = torch.argmin(flat_g)
-            neg_y, neg_x = divmod(int(neg_idx.item()), w)
+            ny = int(neg_idx // w)
+            nx = int(neg_idx %  w)
+            neg_y, neg_x = ny, nx
+
             neg_x = float(max(0, min(w - 1, neg_x)))
             neg_y = float(max(0, min(h - 1, neg_y)))
             batch_coords.append([neg_x, neg_y])
@@ -367,7 +351,7 @@ if __name__ == "__main__":
     parser.add_argument("--class_name", type=str, default=None, help="Specific class to run. If None, runs all found classes.")
     parser.add_argument("--ref_idx", type=str, default="00", help="Index of reference image (e.g., '00').")
     parser.add_argument("--output_dir", type=str, default="./outputs", help="Where to save results.")
-    parser.add_argument("--num_prompt_clusters", type=int, default=1,help="cluster on reference-level")
+    parser.add_argument("--num_prompt_clusters", type=int, default=5,help="cluster on reference-level")
 
     args = parser.parse_args()
 
