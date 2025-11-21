@@ -6,4 +6,4 @@ Peak locations become positive points, plus one negative point, forming an autom
 - Supports multi-component / separated objects
 - K-Means on dense foreground features
 - Multi-peak similarity → automatic multi-point prompts
-- No training required
+- Training free
